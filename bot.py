@@ -146,11 +146,10 @@ def parse_timetable(html: str) -> str:
 
     for day_table in day_tables:
         day_header = day_table.find("td", class_="thead")
-        if day_header:
-            day_text = day_header.get_text(strip=True)
-            result.append(f"\n*{day_text}:*")
+        day_text = day_header.get_text(strip=True) if day_header else ""
 
         rows = day_table.find_all("tr")[1:]
+        day_pairs = []
 
         for row in rows:
             cells = row.find_all("td")
@@ -159,46 +158,73 @@ def parse_timetable(html: str) -> str:
 
             pair_num = cells[0].get_text(strip=True)
             rowtable = cells[1].find("table", class_="rowtable")
-            if not rowtable:
-                continue
 
-            pair_rows = rowtable.find_all("tr")
-            if not pair_rows:
-                continue
+            # Проверяем, есть ли пара
+            is_empty = True
+            subject, teacher, cabinet = "", "", ""
+            second_teacher, second_cabinet = "", ""
 
-            first_row = pair_rows[0]
-            pair_cells = first_row.find_all("td")
-            if not pair_cells:
-                continue
+            if rowtable:
+                pair_rows = rowtable.find_all("tr")
+                if pair_rows:
+                    first_row = pair_rows[0]
+                    pair_cells = first_row.find_all("td")
+                    if pair_cells:
+                        pair_info = pair_cells[0].get_text(strip=True)
+                        if "—" not in pair_info or pair_info.count("—") < 2:
+                            parts = pair_info.split("|")
+                            if len(parts) >= 2:
+                                subject = parts[0].strip()
+                                teacher = parts[1].strip()
+                                cabinet = pair_cells[1].get_text(strip=True) if len(pair_cells) > 1 else "—"
+                                is_empty = False
 
-            pair_info = pair_cells[0].get_text(strip=True)
+                                # Подгруппа 2 при наличии
+                                if len(pair_rows) > 1:
+                                    second_cells = pair_rows[1].find_all("td")
+                                    if second_cells:
+                                        second_info = second_cells[0].get_text(strip=True)
+                                        if "—" not in second_info or second_info.count("—") < 2:
+                                            s_parts = second_info.split("|")
+                                            if len(s_parts) >= 2:
+                                                second_teacher = s_parts[1].strip()
+                                                second_cabinet = second_cells[1].get_text(strip=True) if len(second_cells) > 1 else "—"
 
-            if "—" in pair_info and pair_info.count("—") >= 2:
-                continue
+            day_pairs.append({
+                "num": pair_num,
+                "is_empty": is_empty,
+                "subject": subject,
+                "teacher": teacher,
+                "cabinet": cabinet,
+                "second_teacher": second_teacher,
+                "second_cabinet": second_cabinet,
+            })
 
-            parts = pair_info.split("|")
-            if len(parts) >= 2:
-                subject = parts[0].strip()
-                teacher = parts[1].strip()
-                cabinet = pair_cells[1].get_text(strip=True) if len(pair_cells) > 1 else "—"
+        # Определяем последнюю пару с занятием
+        last_lesson_idx = -1
+        for idx, p in enumerate(day_pairs):
+            if not p["is_empty"]:
+                last_lesson_idx = idx
 
-                result.append(f"{pair_num}) {subject}")
-                result.append(f"├ ⏰ Время: `{TIMES.get(pair_num, '—')}`")
-                result.append(f"├ 👤 Преподаватель: {teacher}")
-                result.append(f"└ 🚪 Кабинет: {cabinet}")
+        # Если на день вообще нет пар — пропускаем или пишем "Занятий нет"
+        if last_lesson_idx == -1:
+            continue
 
-                # Подгруппа 2 при наличии
-                if len(pair_rows) > 1:
-                    second_row = pair_rows[1]
-                    second_cells = second_row.find_all("td")
-                    if second_cells:
-                        second_info = second_cells[0].get_text(strip=True)
-                        if "—" not in second_info or second_info.count("—") < 2:
-                            second_parts = second_info.split("|")
-                            if len(second_parts) >= 2:
-                                second_teacher = second_parts[1].strip()
-                                second_cabinet = second_cells[1].get_text(strip=True) if len(second_cells) > 1 else "—"
-                                result.append(f"└ 👥 Подгруппа 2: {second_teacher} | Каб: {second_cabinet}")
+        if day_text:
+            result.append(f"\n*{day_text}:*")
+
+        # Показываем все пары до последней пары с занятиями (включая окна и отсутствующие первые пары)
+        for p in day_pairs[:last_lesson_idx + 1]:
+            p_num = p["num"]
+            if p["is_empty"]:
+                result.append(f"{p_num}) — нет")
+            else:
+                result.append(f"{p_num}) {p['subject']}")
+                result.append(f"├ ⏰ Время: `{TIMES.get(p_num, '—')}`")
+                result.append(f"├ 👤 Преподаватель: {p['teacher']}")
+                result.append(f"└ 🚪 Кабинет: {p['cabinet']}")
+                if p["second_teacher"]:
+                    result.append(f"└ 👥 Подгруппа 2: {p['second_teacher']} | Каб: {p['second_cabinet']}")
 
     return "\n".join(result) if len(result) > 1 else "📭 Расписание не найдено."
 
@@ -432,7 +458,7 @@ async def handle_timetable(message: Message, state: FSMContext):
         await message.answer(
             "📋 *Расписание*\n\n"
             "Ты ещё не выбрал свою группу.\n"
-            "Введи название группы _(например: П-21)_:",
+            "Введи название группы _(например: АС-11)_:",
             parse_mode="Markdown",
             reply_markup=cancel_keyboard()
         )
@@ -457,7 +483,7 @@ async def handle_change_group(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "🔄 *Смена группы*\n\n"
-        "Введи название своей группы _(например: П-21)_:",
+        "Введи название своей группы _(например: АС-11)_:",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard()
     )
@@ -467,9 +493,15 @@ async def handle_change_group(message: Message, state: FSMContext):
 @dp.message(BotStates.waiting_group)
 async def process_group_input(message: Message, state: FSMContext):
     """Обрабатывает ввод группы. При опечатке — подсказывает через difflib."""
-    raw = message.text.strip()
-    group_name = raw.upper()
-    group_id = GROUPS.get(group_name)
+    raw = message.text.strip().upper()
+
+    # Заменяем похожие латинские буквы на кириллицу (например AC-11 -> АС-11)
+    trans = str.maketrans("ABCETYOPXKMH", "АВСЕТУОРХКМН")
+    group_name = raw.translate(trans)
+
+    group_id = GROUPS.get(group_name) or GROUPS.get(raw)
+    if group_id:
+        group_name = next((k for k in GROUPS if k == group_name or k == raw), group_name)
     user_id = message.from_user.id
 
     if group_id:
@@ -498,14 +530,14 @@ async def process_group_input(message: Message, state: FSMContext):
             await message.answer(
                 f"❌ Группа *{group_name}* не найдена.\n\n"
                 f"💡 Возможно, ты имел в виду: {suggestions}?\n\n"
-                "Введи название ещё раз:",
+                "Введи название ещё раз _(например: АС-11)_:",
                 parse_mode="Markdown",
                 reply_markup=cancel_keyboard()
             )
         else:
             await message.answer(
                 f"❌ Группа *{group_name}* не найдена.\n\n"
-                "Проверь правильность написания _(например: П-21, КС-11, Ю-32)_ и попробуй ещё раз:",
+                "Проверь правильность написания _(например: АС-11, КС-11, П-31)_ и попробуй ещё раз:",
                 parse_mode="Markdown",
                 reply_markup=cancel_keyboard()
             )
