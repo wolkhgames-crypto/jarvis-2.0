@@ -1,11 +1,15 @@
 """
 Jarvis 2.0 — Telegram бот для студентов СРМК
 Функции:
-1. 📋 Расписание занятий группы (без авторизации)
-2. 👁️ Поиск преподавателя по всем группам (без авторизации)
+1. 📋 Расписание занятий группы (выбор группы через текстовый ввод)
+2. 🔄 Сменить группу — поменять сохранённую группу
+3. 👁️ Поиск преподавателя — только для администраторов
+4. 📢 Рассылка — отправка сообщений всем, только для администраторов
+5. 📊 Статистика — аналитика, только для администраторов
 """
 
 import asyncio
+import difflib
 import logging
 import os
 from datetime import datetime
@@ -23,23 +27,21 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from groups import GROUPS
+import storage
 
 load_dotenv()
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Белый список Telegram ID (через запятую в .env, например: "2035205294,123456789")
-# Если переменная пустая — бот доступен всем
-raw_allowed = os.getenv("ALLOWED_USERS", "2035205294").strip()
-ALLOWED_USERS = [uid.strip() for uid in raw_allowed.split(",") if uid.strip()]
+# Список Telegram ID администраторов (через запятую в .env)
+# Пример: ADMIN_IDS=2035205294,123456789
+raw_admins = os.getenv("ADMIN_IDS", "2035205294").strip()
+ADMIN_IDS: list[str] = [uid.strip() for uid in raw_admins.split(",") if uid.strip()]
 
 # Настройки Moodle
 BASE_URL = "https://rmk.stavedu.ru:8010/moodle"
 TIMETABLE_URL = f"{BASE_URL}/eioswork/timetable/watchstudent.php"
-
-# ID группы по умолчанию (238 = П-31 / П-21)
-DEFAULT_GROUP_ID = os.getenv("DEFAULT_GROUP_ID", "238").strip()
 
 # Расписание звонков
 TIMES = {
@@ -54,46 +56,67 @@ TIMES = {
 
 dp = Dispatcher(storage=MemoryStorage())
 
+
 # ==================== СОСТОЯНИЯ FSM ====================
 class BotStates(StatesGroup):
     waiting_teacher_name = State()
+    waiting_group = State()
+    waiting_broadcast_text = State()
+    waiting_broadcast_confirm = State()
+
+
+# ==================== ПРОВЕРКА ПРАВ ====================
+def is_admin(user_id: int | str) -> bool:
+    """Проверяет, является ли пользователь администратором."""
+    return str(user_id) in ADMIN_IDS
+
 
 # ==================== КЛАВИАТУРЫ ====================
-def main_keyboard() -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота"""
+def user_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура обычного пользователя."""
     buttons = [
-        [KeyboardButton(text="📋 Расписание"), KeyboardButton(text="👁️ Поиск преподавателя")]
+        [KeyboardButton(text="📋 Расписание"), KeyboardButton(text="🔄 Сменить группу")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    """Расширенная клавиатура администратора."""
+    buttons = [
+        [KeyboardButton(text="📋 Расписание"), KeyboardButton(text="🔄 Сменить группу")],
+        [KeyboardButton(text="👁️ Поиск преподавателя")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="📊 Статистика")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def get_main_keyboard(user_id: int | str) -> ReplyKeyboardMarkup:
+    """Возвращает подходящую клавиатуру в зависимости от роли."""
+    return admin_keyboard() if is_admin(user_id) else user_keyboard()
+
+
 def cancel_keyboard() -> ReplyKeyboardMarkup:
-    """Клавиатура с кнопкой отмены"""
+    """Клавиатура с кнопкой отмены."""
     buttons = [[KeyboardButton(text="❌ Отмена")]]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# ==================== ПРОВЕРКА ДОСТУПА ====================
-def is_user_allowed(user_id: int | str) -> bool:
-    """Проверяет, есть ли пользователь в белом списке"""
-    if not ALLOWED_USERS:
-        return True
-    return str(user_id) in ALLOWED_USERS
 
-async def check_access(message: Message) -> bool:
-    """Проверка доступа с отправкой сообщения при отказе"""
-    if not is_user_allowed(message.from_user.id):
-        await message.answer("❌ Доступ запрещён. Ваш Telegram ID не в белом списке бота.")
-        return False
-    return True
+def confirm_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура подтверждения рассылки."""
+    buttons = [
+        [KeyboardButton(text="✅ Да, отправить"), KeyboardButton(text="❌ Нет, отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def send_long_message(message: Message, text: str, reply_markup=None, parse_mode="Markdown"):
-    """Отправляет длинные сообщения частями (лимит Telegram 4096 символов)"""
+    """Отправляет длинные сообщения частями (лимит Telegram 4096 символов)."""
     MAX_LEN = 4000
     if len(text) <= MAX_LEN:
         await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
 
-    # Разбиваем по строкам
     lines = text.split("\n")
     chunk = ""
     for line in lines:
@@ -105,9 +128,10 @@ async def send_long_message(message: Message, text: str, reply_markup=None, pars
     if chunk:
         await message.answer(chunk, reply_markup=reply_markup, parse_mode=parse_mode)
 
+
 # ==================== ПАРСИНГ РАСПИСАНИЯ ====================
 def parse_timetable(html: str) -> str:
-    """Парсит HTML страницу расписания группы"""
+    """Парсит HTML страницу расписания группы."""
     soup = BeautifulSoup(html, "html.parser")
     day_tables = soup.find_all("table", class_="daytable")
 
@@ -116,7 +140,7 @@ def parse_timetable(html: str) -> str:
 
     # Извлекаем заголовок группы (например: "Группа П-31")
     header_tag = soup.find(["h1", "h2", "h3", "h4"])
-    group_title = header_tag.get_text(strip=True) if header_tag else "П-31"
+    group_title = header_tag.get_text(strip=True) if header_tag else "Группа"
 
     result = [f"📅 *Расписание занятий ({group_title})*\n"]
 
@@ -178,8 +202,9 @@ def parse_timetable(html: str) -> str:
 
     return "\n".join(result) if len(result) > 1 else "📭 Расписание не найдено."
 
-async def fetch_timetable_public(group_id: str = DEFAULT_GROUP_ID) -> str:
-    """Загружает и парсит расписание для указанной группы без авторизации"""
+
+async def fetch_timetable_public(group_id: str) -> str:
+    """Загружает и парсит расписание для указанной группы без авторизации."""
     now = datetime.now()
     url = f"{TIMETABLE_URL}?year={now.year}&month={now.month}&group={group_id}"
 
@@ -197,9 +222,10 @@ async def fetch_timetable_public(group_id: str = DEFAULT_GROUP_ID) -> str:
         logging.error(f"Ошибка получения расписания: {e}")
         return "❌ Сервер Moodle временно недоступен. Попробуйте позже."
 
+
 # ==================== ПОИСК ПРЕПОДАВАТЕЛЕЙ ====================
 async def fetch_group_timetable_html(session: ClientSession, group_id: str) -> Tuple[str, Optional[str]]:
-    """Получает HTML расписания для конкретной группы"""
+    """Получает HTML расписания для конкретной группы."""
     now = datetime.now()
     url = f"{TIMETABLE_URL}?year={now.year}&month={now.month}&group={group_id}"
     try:
@@ -210,8 +236,9 @@ async def fetch_group_timetable_html(session: ClientSession, group_id: str) -> T
     except:
         return (group_id, None)
 
+
 async def search_teacher_public(teacher_name: str) -> str:
-    """Параллельно ищет преподавателя по всем группам"""
+    """Параллельно ищет преподавателя по всем группам."""
     schedule_by_day: Dict[str, list] = {}
     teacher_query = teacher_name.strip().lower()
 
@@ -358,54 +385,138 @@ async def search_teacher_public(teacher_name: str) -> str:
 
     return "\n".join(result)
 
+
 # ==================== ХЭНДЛЕРЫ КОМАНД ====================
 @dp.message(CommandStart())
 @dp.message(Command("help"))
 async def cmd_start(message: Message, state: FSMContext):
-    """Обработка /start и /help"""
-    if not await check_access(message):
-        return
-
+    """Обработка /start и /help — регистрирует пользователя, показывает меню."""
     await state.clear()
+    user = message.from_user
+    await storage.register_user(user.id, user.username)
+
     welcome_text = (
         "👋 *Привет! Я Jarvis 2.0* — бот расписания СРМК.\n\n"
         "✨ *Доступные функции:*\n"
-        "• 📋 *Расписание* — расписание занятий группы\n"
-        "• 👁️ *Поиск преподавателя* — найти пары любого преподавателя по всем группам\n\n"
-        "⚡ _Работает быстро и без авторизации в Moodle!_\n\n"
-        "Выберите действие в меню ниже 👇"
+        "• 📋 *Расписание* — расписание занятий твоей группы\n"
+        "• 🔄 *Сменить группу* — изменить выбранную группу\n"
     )
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=main_keyboard())
+    if is_admin(user.id):
+        welcome_text += (
+            "• 👁️ *Поиск преподавателя* — найти пары любого преподавателя\n"
+            "• 📢 *Рассылка* — отправить сообщение всем пользователям\n"
+            "• 📊 *Статистика* — аналитика бота\n"
+        )
+    welcome_text += "\n⚡ _Работает быстро и без авторизации в Moodle!_\n\nВыберите действие в меню ниже 👇"
+
+    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_keyboard(user.id))
+
 
 @dp.message(F.text == "❌ Отмена")
+@dp.message(F.text == "❌ Нет, отмена")
 async def cmd_cancel(message: Message, state: FSMContext):
-    """Отмена текущего действия"""
-    if not await check_access(message):
-        return
-
+    """Отмена текущего действия."""
     await state.clear()
-    await message.answer("Действие отменено.", reply_markup=main_keyboard())
+    await message.answer("Действие отменено.", reply_markup=get_main_keyboard(message.from_user.id))
 
-# ==================== ОБРАБОТКА КНОПОК И СООБЩЕНИЙ ====================
+
+# ==================== РАСПИСАНИЕ ====================
 @dp.message(F.text == "📋 Расписание")
 async def handle_timetable(message: Message, state: FSMContext):
-    """Кнопка расписания"""
-    if not await check_access(message):
+    """Кнопка расписания — если группа не выбрана, запрашивает её."""
+    await state.clear()
+    user_id = message.from_user.id
+    group_id = await storage.get_user_group(user_id)
+
+    if not group_id:
+        await message.answer(
+            "📋 *Расписание*\n\n"
+            "Ты ещё не выбрал свою группу.\n"
+            "Введи название группы _(например: П-21)_:",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
+        await state.set_state(BotStates.waiting_group)
         return
 
-    await state.clear()
     wait_msg = await message.answer("⏳ Загружаю расписание...")
-    result = await fetch_timetable_public(DEFAULT_GROUP_ID)
+    result = await fetch_timetable_public(group_id)
+    await storage.increment_views()
+
     try:
         await wait_msg.delete()
     except:
         pass
-    await send_long_message(message, result, reply_markup=main_keyboard())
 
+    await send_long_message(message, result, reply_markup=get_main_keyboard(user_id))
+
+
+@dp.message(F.text == "🔄 Сменить группу")
+async def handle_change_group(message: Message, state: FSMContext):
+    """Кнопка смены группы — запрашивает новую группу текстом."""
+    await state.clear()
+    await message.answer(
+        "🔄 *Смена группы*\n\n"
+        "Введи название своей группы _(например: П-21)_:",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard()
+    )
+    await state.set_state(BotStates.waiting_group)
+
+
+@dp.message(BotStates.waiting_group)
+async def process_group_input(message: Message, state: FSMContext):
+    """Обрабатывает ввод группы. При опечатке — подсказывает через difflib."""
+    raw = message.text.strip()
+    group_name = raw.upper()
+    group_id = GROUPS.get(group_name)
+    user_id = message.from_user.id
+
+    if group_id:
+        await storage.set_user_group(user_id, group_id, group_name)
+        await state.clear()
+
+        # Сразу показываем расписание
+        wait_msg = await message.answer(
+            f"✅ Группа *{group_name}* сохранена!\n\n⏳ Загружаю расписание...",
+            parse_mode="Markdown"
+        )
+        result = await fetch_timetable_public(group_id)
+        await storage.increment_views()
+
+        try:
+            await wait_msg.delete()
+        except:
+            pass
+
+        await send_long_message(message, result, reply_markup=get_main_keyboard(user_id))
+    else:
+        # Ищем похожие группы через difflib
+        close = difflib.get_close_matches(group_name, GROUPS.keys(), n=3, cutoff=0.6)
+        if close:
+            suggestions = ", ".join(f"`{g}`" for g in close)
+            await message.answer(
+                f"❌ Группа *{group_name}* не найдена.\n\n"
+                f"💡 Возможно, ты имел в виду: {suggestions}?\n\n"
+                "Введи название ещё раз:",
+                parse_mode="Markdown",
+                reply_markup=cancel_keyboard()
+            )
+        else:
+            await message.answer(
+                f"❌ Группа *{group_name}* не найдена.\n\n"
+                "Проверь правильность написания _(например: П-21, КС-11, Ю-32)_ и попробуй ещё раз:",
+                parse_mode="Markdown",
+                reply_markup=cancel_keyboard()
+            )
+
+
+# ==================== ПОИСК ПРЕПОДАВАТЕЛЯ (ТОЛЬКО АДМИН) ====================
 @dp.message(F.text == "👁️ Поиск преподавателя")
 async def handle_teacher_search_prompt(message: Message, state: FSMContext):
-    """Запрос фамилии преподавателя"""
-    if not await check_access(message):
+    """Запрос фамилии преподавателя — только для администраторов."""
+    if not is_admin(message.from_user.id):
+        await message.answer("Выберите действие из меню:", reply_markup=get_main_keyboard(message.from_user.id))
         return
 
     await state.set_state(BotStates.waiting_teacher_name)
@@ -417,10 +528,12 @@ async def handle_teacher_search_prompt(message: Message, state: FSMContext):
         reply_markup=cancel_keyboard()
     )
 
+
 @dp.message(BotStates.waiting_teacher_name)
 async def handle_teacher_search_execute(message: Message, state: FSMContext):
-    """Выполнение поиска преподавателя"""
-    if not await check_access(message):
+    """Выполнение поиска преподавателя."""
+    if not is_admin(message.from_user.id):
+        await state.clear()
         return
 
     query = message.text.strip()
@@ -428,7 +541,10 @@ async def handle_teacher_search_execute(message: Message, state: FSMContext):
         await message.answer("❌ Введите хотя бы 2 буквы фамилии:", reply_markup=cancel_keyboard())
         return
 
-    wait_msg = await message.answer("⏳ Ищу преподавателя по всем группам СРМК...\n_Это займёт 5-15 секунд._", parse_mode="Markdown")
+    wait_msg = await message.answer(
+        "⏳ Ищу преподавателя по всем группам СРМК...\n_Это займёт 5-15 секунд._",
+        parse_mode="Markdown"
+    )
     result = await search_teacher_public(query)
     await state.clear()
 
@@ -437,14 +553,141 @@ async def handle_teacher_search_execute(message: Message, state: FSMContext):
     except:
         pass
 
-    await send_long_message(message, result, reply_markup=main_keyboard())
+    await send_long_message(message, result, reply_markup=get_main_keyboard(message.from_user.id))
 
-@dp.message()
-async def handle_unknown(message: Message):
-    """Обработка неизвестных сообщений"""
-    if not await check_access(message):
+
+# ==================== РАССЫЛКА (ТОЛЬКО АДМИН) ====================
+@dp.message(F.text == "📢 Рассылка")
+async def handle_broadcast_start(message: Message, state: FSMContext):
+    """Начало рассылки — только для администраторов."""
+    if not is_admin(message.from_user.id):
+        await message.answer("Выберите действие из меню:", reply_markup=get_main_keyboard(message.from_user.id))
         return
-    await message.answer("Выберите действие из меню:", reply_markup=main_keyboard())
+
+    await state.set_state(BotStates.waiting_broadcast_text)
+    await message.answer(
+        "📢 *Рассылка*\n\n"
+        "Введите текст сообщения для отправки всем пользователям бота.\n"
+        "_Поддерживается Markdown-разметка._",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard()
+    )
+
+
+@dp.message(BotStates.waiting_broadcast_text)
+async def handle_broadcast_text(message: Message, state: FSMContext):
+    """Сохраняет текст рассылки и запрашивает подтверждение."""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    broadcast_text = message.text.strip()
+    if not broadcast_text:
+        await message.answer("❌ Текст не может быть пустым. Введите сообщение для рассылки:")
+        return
+
+    await state.update_data(broadcast_text=broadcast_text)
+    await state.set_state(BotStates.waiting_broadcast_confirm)
+
+    user_count = len(await storage.get_all_user_ids())
+    await message.answer(
+        f"📋 *Предпросмотр сообщения:*\n\n{broadcast_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Будет отправлено: *{user_count}* пользователям.\n"
+        f"Подтверждаешь рассылку?",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard()
+    )
+
+
+@dp.message(BotStates.waiting_broadcast_confirm, F.text == "✅ Да, отправить")
+async def handle_broadcast_confirm(message: Message, state: FSMContext, bot: Bot):
+    """Выполняет рассылку после подтверждения."""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    broadcast_text = data.get("broadcast_text", "")
+    await state.clear()
+
+    if not broadcast_text:
+        await message.answer("❌ Текст рассылки не найден.", reply_markup=get_main_keyboard(message.from_user.id))
+        return
+
+    all_user_ids = await storage.get_all_user_ids()
+    total = len(all_user_ids)
+    sent = 0
+    failed = 0
+
+    status_msg = await message.answer(
+        f"📤 Начинаю рассылку для {total} пользователей...",
+        reply_markup=get_main_keyboard(message.from_user.id)
+    )
+
+    for uid in all_user_ids:
+        try:
+            await bot.send_message(int(uid), broadcast_text, parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logging.warning(f"Не удалось отправить сообщение пользователю {uid}: {e}")
+        # Небольшая задержка чтобы не упереться в лимиты Telegram
+        await asyncio.sleep(0.05)
+
+    try:
+        await status_msg.delete()
+    except:
+        pass
+
+    await message.answer(
+        f"✅ *Рассылка завершена!*\n\n"
+        f"📊 Итог:\n"
+        f"• ✅ Доставлено: *{sent}* из *{total}*\n"
+        f"• ❌ Не доставлено: *{failed}* _(заблокировали бота или ошибка)_",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(message.from_user.id)
+    )
+
+
+# ==================== СТАТИСТИКА (ТОЛЬКО АДМИН) ====================
+@dp.message(F.text == "📊 Статистика")
+async def handle_stats(message: Message, state: FSMContext):
+    """Отображает статистику бота — только для администраторов."""
+    if not is_admin(message.from_user.id):
+        await message.answer("Выберите действие из меню:", reply_markup=get_main_keyboard(message.from_user.id))
+        return
+
+    await state.clear()
+    stats = await storage.get_stats()
+
+    top_groups_text = ""
+    if stats["top_groups"]:
+        top_groups_text = "\n\n🏆 *Топ-5 популярных групп:*\n"
+        for i, (gname, count) in enumerate(stats["top_groups"], 1):
+            top_groups_text += f"  {i}. *{gname}* — {count} чел.\n"
+    else:
+        top_groups_text = "\n\n_Пока ни один пользователь не выбрал группу._"
+
+    text = (
+        "📊 *Статистика Jarvis 2.0*\n\n"
+        f"👥 Всего пользователей: *{stats['total_users']}*\n"
+        f"🎓 Выбрали группу: *{stats['users_with_group']}*\n"
+        f"📋 Просмотров расписания: *{stats['schedule_views']}*"
+        f"{top_groups_text}"
+    )
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_main_keyboard(message.from_user.id))
+
+
+# ==================== НЕИЗВЕСТНЫЕ СООБЩЕНИЯ ====================
+@dp.message()
+async def handle_unknown(message: Message, state: FSMContext):
+    """Обработка неизвестных сообщений — регистрирует и показывает меню."""
+    user = message.from_user
+    await storage.register_user(user.id, user.username)
+    await message.answer("Выберите действие из меню:", reply_markup=get_main_keyboard(user.id))
+
 
 # ==================== ТОЧКА ВХОДА ====================
 async def main():
@@ -465,6 +708,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
