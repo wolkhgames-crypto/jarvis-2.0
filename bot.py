@@ -148,15 +148,19 @@ def parse_timetable(html: str) -> str:
         day_header = day_table.find("td", class_="thead")
         day_text = day_header.get_text(strip=True) if day_header else ""
 
-        rows = day_table.find_all("tr")[1:]
+        # Берем только прямые строки таблицы дня (исключаем внутренние строки rowtable!)
+        rows = [tr for tr in day_table.find_all("tr") if tr.find_parent("table") == day_table][1:]
         day_pairs = []
 
         for row in rows:
-            cells = row.find_all("td")
+            cells = [td for td in row.find_all("td") if td.find_parent("tr") == row]
             if len(cells) < 2:
                 continue
 
             pair_num = cells[0].get_text(strip=True)
+            if not pair_num.isdigit():
+                continue
+
             rowtable = cells[1].find("table", class_="rowtable")
 
             # Проверяем, есть ли пара
@@ -165,30 +169,39 @@ def parse_timetable(html: str) -> str:
             second_teacher, second_cabinet = "", ""
 
             if rowtable:
-                pair_rows = rowtable.find_all("tr")
+                pair_rows = [tr for tr in rowtable.find_all("tr") if tr.find_parent("table") == rowtable]
                 if pair_rows:
                     first_row = pair_rows[0]
-                    pair_cells = first_row.find_all("td")
+                    pair_cells = [td for td in first_row.find_all("td") if td.find_parent("tr") == first_row]
                     if pair_cells:
                         pair_info = pair_cells[0].get_text(strip=True)
                         if "—" not in pair_info or pair_info.count("—") < 2:
                             parts = pair_info.split("|")
                             if len(parts) >= 2:
-                                subject = parts[0].strip()
-                                teacher = parts[1].strip()
-                                cabinet = pair_cells[1].get_text(strip=True) if len(pair_cells) > 1 else "—"
-                                is_empty = False
+                                s_name = parts[0].strip()
+                                t_name = parts[1].strip()
+                                if s_name != "—" and t_name != "—":
+                                    subject = s_name
+                                    teacher = t_name
+                                    cabinet = pair_cells[1].get_text(strip=True) if len(pair_cells) > 1 else "—"
+                                    is_empty = False
 
-                                # Подгруппа 2 при наличии
-                                if len(pair_rows) > 1:
-                                    second_cells = pair_rows[1].find_all("td")
-                                    if second_cells:
-                                        second_info = second_cells[0].get_text(strip=True)
-                                        if "—" not in second_info or second_info.count("—") < 2:
-                                            s_parts = second_info.split("|")
-                                            if len(s_parts) >= 2:
-                                                second_teacher = s_parts[1].strip()
-                                                second_cabinet = second_cells[1].get_text(strip=True) if len(second_cells) > 1 else "—"
+                    # Подгруппа 2: показываем ТОЛЬКО если она реально есть и не дублирует подгруппу 1
+                    if len(pair_rows) > 1 and not is_empty:
+                        second_row = pair_rows[1]
+                        second_cells = [td for td in second_row.find_all("td") if td.find_parent("tr") == second_row]
+                        if second_cells:
+                            second_info = second_cells[0].get_text(strip=True)
+                            if second_info and ("—" not in second_info or second_info.count("—") < 2):
+                                s_parts = second_info.split("|")
+                                if len(s_parts) >= 2:
+                                    s2_subj = s_parts[0].strip()
+                                    s2_teacher = s_parts[1].strip()
+                                    s2_cab = second_cells[1].get_text(strip=True) if len(second_cells) > 1 else "—"
+                                    if s2_teacher != "—" and s2_subj != "—":
+                                        if s2_teacher != teacher or (s2_cab != cabinet and s2_cab != "—"):
+                                            second_teacher = s2_teacher
+                                            second_cabinet = s2_cab
 
             day_pairs.append({
                 "num": pair_num,
@@ -206,7 +219,7 @@ def parse_timetable(html: str) -> str:
             if not p["is_empty"]:
                 last_lesson_idx = idx
 
-        # Если на день вообще нет пар — пропускаем или пишем "Занятий нет"
+        # Если на день вообще нет пар — не выводим его
         if last_lesson_idx == -1:
             continue
 
@@ -311,25 +324,28 @@ async def search_teacher_public(teacher_name: str) -> str:
                     continue
 
                 day_text = day_header.get_text(strip=True)
-                rows = day_table.find_all("tr")[1:]
+                rows = [tr for tr in day_table.find_all("tr") if tr.find_parent("table") == day_table][1:]
 
                 for row in rows:
-                    cells = row.find_all("td")
+                    cells = [td for td in row.find_all("td") if td.find_parent("tr") == row]
                     if len(cells) < 2:
                         continue
 
                     pair_num = cells[0].get_text(strip=True)
+                    if not pair_num.isdigit():
+                        continue
+
                     rowtable = cells[1].find("table", class_="rowtable")
                     if not rowtable:
                         continue
 
-                    pair_rows = rowtable.find_all("tr")
+                    pair_rows = [tr for tr in rowtable.find_all("tr") if tr.find_parent("table") == rowtable]
                     if not pair_rows:
                         continue
 
                     # Подгруппа 1
                     first_row = pair_rows[0]
-                    pair_cells = first_row.find_all("td")
+                    pair_cells = [td for td in first_row.find_all("td") if td.find_parent("tr") == first_row]
                     if pair_cells:
                         pair_info = pair_cells[0].get_text(strip=True)
                         if not ("—" in pair_info and pair_info.count("—") >= 2):
@@ -351,7 +367,7 @@ async def search_teacher_public(teacher_name: str) -> str:
                     # Подгруппа 2
                     if len(pair_rows) > 1:
                         second_row = pair_rows[1]
-                        second_cells = second_row.find_all("td")
+                        second_cells = [td for td in second_row.find_all("td") if td.find_parent("tr") == second_row]
                         if second_cells:
                             second_info = second_cells[0].get_text(strip=True)
                             if not ("—" in second_info and second_info.count("—") >= 2):
