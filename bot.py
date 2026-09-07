@@ -12,6 +12,7 @@ import asyncio
 import difflib
 import logging
 import os
+import time
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
@@ -38,6 +39,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Пример: ADMIN_IDS=2035205294,123456789
 raw_admins = os.getenv("ADMIN_IDS", "2035205294").strip()
 ADMIN_IDS: list[str] = [uid.strip() for uid in raw_admins.split(",") if uid.strip()]
+
+# Кулдаун (кд) между запросами расписания в секундах (по умолчанию 300 сек = 5 минут)
+SCHEDULE_COOLDOWN = int(os.getenv("SCHEDULE_COOLDOWN", "300"))
+
+# Хранилище времени последнего запроса расписания пользователем: {user_id: timestamp}
+user_schedule_cooldowns: dict[int, float] = {}
 
 # Настройки Moodle
 BASE_URL = "https://rmk.stavedu.ru:8010/moodle"
@@ -69,6 +76,28 @@ class BotStates(StatesGroup):
 def is_admin(user_id: int | str) -> bool:
     """Проверяет, является ли пользователь администратором."""
     return str(user_id) in ADMIN_IDS
+
+
+def get_cooldown_remaining(user_id: int | str) -> int:
+    """Возвращает оставшееся время кулдауна в секундах, либо 0 если кулдаун истёк."""
+    if is_admin(user_id):
+        return 0
+    last_time = user_schedule_cooldowns.get(int(user_id))
+    if not last_time:
+        return 0
+    elapsed = time.time() - last_time
+    if elapsed < SCHEDULE_COOLDOWN:
+        return max(1, int(SCHEDULE_COOLDOWN - elapsed))
+    return 0
+
+
+def format_remaining_time(seconds: int) -> str:
+    """Форматирует секунды в читаемую строку (например '4 мин 30 сек' или '15 сек')."""
+    mins = seconds // 60
+    secs = seconds % 60
+    if mins > 0:
+        return f"{mins} мин {secs} сек"
+    return f"{secs} сек"
 
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -465,7 +494,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
 # ==================== РАСПИСАНИЕ ====================
 @dp.message(F.text == "📋 Расписание")
 async def handle_timetable(message: Message, state: FSMContext):
-    """Кнопка расписания — если группа не выбрана, запрашивает её."""
+    """Кнопка расписания — если группа не выбрана, запрашивает её. Действует кулдаун 5 минут."""
     await state.clear()
     user_id = message.from_user.id
     group_id = await storage.get_user_group(user_id)
@@ -480,6 +509,22 @@ async def handle_timetable(message: Message, state: FSMContext):
         )
         await state.set_state(BotStates.waiting_group)
         return
+
+    # Проверка кулдауна на спам кнопки расписания (5 минут)
+    remaining = get_cooldown_remaining(user_id)
+    if remaining > 0:
+        time_str = format_remaining_time(remaining)
+        await message.answer(
+            f"⏳ *Подожди немного!*\n\n"
+            f"Запрашивать расписание можно не чаще одного раза в 5 минут, чтобы не перегружать сервер.\n\n"
+            f"До следующего запроса осталось: *{time_str}*.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        return
+
+    # Фиксируем время запроса для кулдауна
+    user_schedule_cooldowns[user_id] = time.time()
 
     wait_msg = await message.answer("⏳ Загружаю расписание...")
     result = await fetch_timetable_public(group_id)
@@ -523,6 +568,9 @@ async def process_group_input(message: Message, state: FSMContext):
     if group_id:
         await storage.set_user_group(user_id, group_id, group_name)
         await state.clear()
+
+        # Фиксируем время запроса для кулдауна
+        user_schedule_cooldowns[user_id] = time.time()
 
         # Сразу показываем расписание
         wait_msg = await message.answer(
